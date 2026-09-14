@@ -1,0 +1,212 @@
+// ==UserScript==
+// @name         Bazaar Auto Pricer
+// @match        https://www.torn.com/bazaar.php*
+// @grant        none
+// ==/UserScript==
+//
+// WHAT THIS DOES
+// On your Bazaar "Add items" page: tap any item's icon like you normally
+// would (to open Torn's own item info panel). A moment later, once that
+// panel has rendered its "Value: $X", this script automatically fills
+// that row's Price field with (Value − your chosen %) and its Qty field
+// with however many of that item you own. You still tap Torn's own
+// submit/save button — this only fills the fields, it never submits.
+//
+// A small floating control (bottom-right) shows "% below Value" with
+// −/+ buttons, and tapping the number itself lets you type an exact
+// percentage. Your chosen percentage is remembered on this device.
+//
+// NO API KEY NEEDED — it never calls the Torn API, it just reads the
+// Value figure straight off Torn's own panel after you open it.
+//
+// HOW ROW DETECTION WORKS
+// Torn's page is a React app with auto-generated class names that change
+// with updates, so this doesn't hardcode a CSS class. When you tap an
+// item icon, it walks up the DOM from that icon until it finds the
+// smallest surrounding element that also contains a "Qty" input — that's
+// treated as "the row" for that item.
+
+(function () {
+  'use strict';
+
+  // ---------- Config ----------
+  const DEFAULT_PERCENT_BELOW = 5; // starting point: price 5% below Value (adjustable via the on-screen control)
+  const MIN_PRICE = 1;             // never price below this
+  const PANEL_WAIT_MS = 500;       // how long to wait after your tap for Torn's Value panel to render
+
+  // ---------- Adjustable "% below Value" setting, persisted locally ----------
+  const PERCENT_STEP = 0.5; // how much the −/+ buttons move per tap
+
+  function getPercentBelow() {
+    const stored = localStorage.getItem('bazaar_autoprice_percent_below');
+    const n = stored !== null ? parseFloat(stored) : DEFAULT_PERCENT_BELOW;
+    return Number.isFinite(n) ? Math.min(Math.max(n, 0), 99) : DEFAULT_PERCENT_BELOW;
+  }
+
+  function setPercentBelow(n) {
+    // Round to 2 decimal places to avoid floating-point noise (e.g. 5.1000000000001)
+    const clamped = Math.min(Math.max(n, 0), 99);
+    const rounded = Math.round(clamped * 100) / 100;
+    localStorage.setItem('bazaar_autoprice_percent_below', String(rounded));
+    return rounded;
+  }
+
+  function formatPercent(n) {
+    // Trim trailing zeros: 5 -> "5", 5.5 -> "5.5", 3.60 -> "3.6"
+    return String(Math.round(n * 100) / 100);
+  }
+
+  // ---------- Find the smallest ancestor of an image that is a real item row ----------
+  function findRowContainer(img) {
+    let el = img.parentElement;
+    for (let i = 0; i < 5 && el; i++) {
+      const inputs = Array.from(el.querySelectorAll('input'));
+      const hasQty = inputs.some(inp => /qty|quantity/i.test(inp.placeholder || ''));
+      if (hasQty && inputs.length >= 2) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // ---------- Get the Qty and Price inputs within a row ----------
+  function getRowInputs(row) {
+    const inputs = Array.from(row.querySelectorAll('input'));
+    const qtyInput = inputs.find(i => /qty|quantity/i.test(i.placeholder || ''));
+    const priceInput = inputs.find(i => i !== qtyInput) || null;
+    return { qtyInput, priceInput };
+  }
+
+  // ---------- Read how many of the item you own from the row's label ----------
+  // Torn shows stackable items as "x19 Bag of Bon Bons" — items with no "xN"
+  // prefix are assumed to be a single (1) item.
+  function getOwnedQuantity(row) {
+    const text = row.textContent || '';
+    const m = text.match(/x(\d+)\s+[A-Z]/);
+    return m ? parseInt(m[1], 10) : 1;
+  }
+
+  // ---------- Read the current "Value: $X" text shown anywhere on the page ----------
+  function readCurrentValue() {
+    const text = document.body.innerText || '';
+    const m = text.match(/Value:\s*\$?([\d,]+)/);
+    if (!m) return null;
+    return parseInt(m[1].replace(/,/g, ''), 10);
+  }
+
+  // ---------- Fill Qty + Price for one row ----------
+  function setInputValue(input, val) {
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    ).set;
+    nativeSetter.call(input, val);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function fillRow(row) {
+    const { qtyInput, priceInput } = getRowInputs(row);
+    if (!priceInput) return;
+
+    const value = readCurrentValue();
+    if (value == null) return;
+
+    const percentBelow = getPercentBelow();
+    let newPrice = Math.round(value * (1 - percentBelow / 100));
+    if (newPrice < MIN_PRICE) newPrice = MIN_PRICE;
+    setInputValue(priceInput, newPrice);
+
+    if (qtyInput) {
+      setInputValue(qtyInput, getOwnedQuantity(row));
+    }
+  }
+
+  // ---------- Small floating control to adjust the % below Value ----------
+  function addPercentControl() {
+    if (document.getElementById('bazaar-autoprice-controls')) return;
+
+    const wrap = document.createElement('div');
+    wrap.id = 'bazaar-autoprice-controls';
+    Object.assign(wrap.style, {
+      position: 'fixed',
+      bottom: '80px',
+      right: '16px',
+      zIndex: 999999,
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      background: 'rgba(20,20,20,0.9)',
+      padding: '8px 10px',
+      borderRadius: '10px',
+      boxShadow: '0 2px 6px rgba(0,0,0,0.4)',
+      fontFamily: 'sans-serif',
+      fontSize: '13px',
+      color: '#fff'
+    });
+
+    const label = document.createElement('span');
+    label.textContent = '% below Value:';
+    label.style.opacity = '0.85';
+
+    const minusBtn = document.createElement('button');
+    minusBtn.textContent = '−';
+    const plusBtn = document.createElement('button');
+    plusBtn.textContent = '+';
+    const valueSpan = document.createElement('span');
+    valueSpan.id = 'bazaar-autoprice-percent-display';
+    Object.assign(valueSpan.style, {
+      minWidth: '34px',
+      textAlign: 'center',
+      fontWeight: 'bold',
+      cursor: 'pointer'
+    });
+
+    [minusBtn, plusBtn].forEach(b => Object.assign(b.style, {
+      width: '28px',
+      height: '28px',
+      border: 'none',
+      borderRadius: '6px',
+      background: '#2d7',
+      color: '#fff',
+      fontWeight: 'bold',
+      fontSize: '16px',
+      lineHeight: '28px',
+      padding: '0'
+    }));
+
+    function refresh() {
+      valueSpan.textContent = formatPercent(getPercentBelow()) + '%';
+    }
+
+    minusBtn.addEventListener('click', () => { setPercentBelow(getPercentBelow() - PERCENT_STEP); refresh(); });
+    plusBtn.addEventListener('click', () => { setPercentBelow(getPercentBelow() + PERCENT_STEP); refresh(); });
+    valueSpan.addEventListener('click', () => {
+      const input = prompt('Set % below Value:', String(getPercentBelow()));
+      if (input === null) return;
+      const n = parseFloat(input);
+      if (Number.isFinite(n)) { setPercentBelow(n); refresh(); }
+    });
+
+    refresh();
+    wrap.appendChild(label);
+    wrap.appendChild(minusBtn);
+    wrap.appendChild(valueSpan);
+    wrap.appendChild(plusBtn);
+    document.body.appendChild(wrap);
+  }
+
+  // ---------- Listen for taps on item icons ----------
+  document.addEventListener('click', (e) => {
+    const img = e.target.closest ? e.target.closest('img') : null;
+    if (!img) return;
+
+    const row = findRowContainer(img);
+    if (!row) return; // not an item icon (e.g. nav bar, avatar, etc.) — ignore
+
+    // Let Torn's own click handling open its Value panel first, then read it
+    setTimeout(() => fillRow(row), PANEL_WAIT_MS);
+  }, true);
+
+  addPercentControl();
+  // Re-add the control if Torn's SPA re-renders the page without a full reload
+  new MutationObserver(addPercentControl).observe(document.body, { childList: true, subtree: true });
+})();
